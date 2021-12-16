@@ -1,0 +1,470 @@
+---
+title: "Wildfire Risk Prediction"
+author: "Alex Cartwright & Max Masuda-Farkas"
+date: "12/17/2021"
+output:
+  html_document:
+    toc: true
+    toc_float: TRUE
+    number_sections: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(include = TRUE, warning=FALSE)
+
+options(scipen = 999)
+
+library(tidyverse)
+library(sf)
+library(raster)
+library(rgdal)
+library(exactextractr)
+library(viridis)
+library(spatstat)
+library(raster)
+library(pscl)
+library(spdep)
+library(caret)
+library(FNN)
+library(grid)
+library(gridExtra)
+library(knitr)
+library(kableExtra)
+library(tidycensus)
+library(plotROC)
+library(pROC)
+
+land_palette <- c("#b6ad90","#bcb8b1","#588157","#2d6a4f","#fff3b0","#d4e09b","#f1dca7","#ba181b","#118ab2")
+palette5 <- c("#533747","#5F506B","#6A6B83","#76949F","#86BBBD")
+palette4 <- c("#533747","#5F506B","#76949F","#86BBBD")
+palette2 <- c("#76949F", "#fb8500")
+```
+
+```{r load_functions, include = FALSE}
+# functions
+root.dir = "https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/DATA/"
+source("https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/functions.r")
+
+# Revised Cross-validate function from chapter 5 (left in chapter)
+crossValidate <- function(dataset, id, dependentVariable, indVariables) {
+  
+  allPredictions <- data.frame()
+  cvID_list <- unique(dataset[[id]])
+  
+  for (i in cvID_list) {
+    
+    thisFold <- i
+    cat("This hold out fold is", thisFold, "\n")
+    
+    fold.train <- filter(dataset, dataset[[id]] != thisFold) %>% as.data.frame() %>% 
+      dplyr::select(id, geometry, indVariables, dependentVariable)
+    fold.test  <- filter(dataset, dataset[[id]] == thisFold) %>% as.data.frame() %>% 
+      dplyr::select(id, geometry, indVariables, dependentVariable)
+    
+    regression <- glm(paste0(dependentVariable,"~."), family = "poisson", 
+    data = fold.train %>% dplyr::select(-geometry, -id))
+    
+    thisPrediction <- 
+      mutate(fold.test, Prediction = predict(regression, fold.test, type = "response"))
+    
+    allPredictions <-
+      rbind(allPredictions, thisPrediction)
+    
+  }
+  return(st_sf(allPredictions))
+}
+
+# #this function converts a column in to quintiles. It is used for mapping.
+# quintileBreaks <- function(df,variable) {
+#   as.character(quantile(df[[variable]],
+#                         c(.01,.2,.4,.6,.8),na.rm=T))
+# }
+# 
+# #This function can be used to convert a polygon sf to centroids xy coords.
+# xyC <- function(aPolygonSF) {
+#   as.data.frame(
+#     cbind(x=st_coordinates(st_centroid(aPolygonSF))[,1],
+#           y=st_coordinates(st_centroid(aPolygonSF))[,2]))
+# } 
+# 
+# #this function convert a raster to a data frame so it can be plotted in ggplot
+rast <- function(inRaster) {
+  data.frame(
+    xyFromCell(inRaster, 1:ncell(inRaster)),
+    value = getValues(inRaster)) }
+```
+
+# Motivation
+
+Project option 5 – Forecasting wildfire risk for a region in California: 
+With climate change, the State of California is exhibiting increased threat of wildfire. No doubt fire risk is a function of climate and weather, but also a host of time-invariant, spatial variables such as vegetation, elevation, land cover and more. Your challenge is to integrate California’s Fire Perimeter data for 2-3 or years with other fire data, vegetation, land cover data, elevation data and other, to estimate fire risk. Can you use spatial cross-validation to validate this model?
+
+There are multiple possible model approaches here. For an app, granted none of us are forestry experts, but can you design a fire management app that prioritizes where naturalist should clear brush, do burns, etc. Maybe, this is an app aimed at insurance companies or homeowners?
+
+# Data
+
+## Initial Data Processing
+
+### Fishnet: Butte County, California Fire District
+
+"Throughout the state, CAL FIRE has 21 operational units that are designed to address fire suppression over a certain geographic area. Each unit operates within their local jurisdiction and strives to fulfill the department's mission whether it be responding to all-risk emergencies, participating in fire safety education and educating homeowners on how to keep their property fire safe."
+
+```{r read_fire_data, include = TRUE, warning = FALSE, message = FALSE}
+# project to NAD 1983 StatePlane California II FIPS 0402 Feet (ESRI:102642)
+butte <- st_read("shapes/CAL_FIRE_Administrative_Units.shp") %>%
+  st_transform('ESRI:102642') %>% dplyr::filter(UNIT == "Butte Unit")
+```
+
+```{r create_fishnet, include = TRUE, warning = FALSE, message = FALSE}
+## using {sf} to create the grid
+## Note the `.[butte] %>% ` line. This is needed to clip the grid to our area
+fishnet <- 
+  st_make_grid(butte,
+               cellsize = 2640, 
+               square = TRUE) %>%
+  .[butte] %>%            # <- MDH Added
+  st_sf() %>%
+  mutate(uniqueID = rownames(.))
+
+netBorder <- st_union(fishnet) %>% st_as_sf()
+
+ggplot() +
+  geom_sf(data = butte, fill = "grey") +
+  geom_sf(data = fishnet, fill = NA, color = "black") +
+  labs(title = "Fishnet, 1/2-mi. by 1/2-mi. cells",
+       subtitle = "Butte County, CA Fire District") +
+  mapTheme()
+```
+
+### Raster Data
+
+DISCUSS DATA SOURCES, WHAT WE HOPE TO GET OUT OF THEM, ETC.
+
+#### NLCD Land Cover data
+
+The first raster source used is from the National Land Cover Database (NLCD). The satellite imagery covers the entire lower 48 US states with a resolution of 30 ft. by 30 ft. After loading the data, it is clipped to the extent of Butte County and reclassified so that all pixel values that do not correspond to a NLCD land cover classification are given a value of 0.
+
+```{r clean NCLD land cover raster data}
+nlcd_temp <- raster('data/landCover/nlcd_2019_land_cover_l48_20210604.img')
+nlcd <- nlcd_temp %>% crop(y = butte %>% st_transform(crs(nlcd_temp)))
+rm(nlcd_temp)
+
+# reclassify the NLCD data - just an example from CPLN675, might need to do it different
+
+# create a dataframe defining the classifications // the upper value of a range is inclusive
+reclass_df <- c(0, 10, 0,
+                10, 11, 11, # open water
+                11, 12, 12, # perennial snow/ice
+                12, 20, 0,
+                20, 21, 21, # developed, open space
+                21, 22, 22, # developed, low intensity
+                22, 23, 23, # developed, med intensity
+                23, 24, 24, # developed, high intensity
+                24, 30, 0,
+                30, 31, 31, # barren
+                31, 40, 0,
+                40, 41, 41, # deciduous forest
+                41, 42, 42, # evergreen forest
+                42, 43, 43, # mixed forest
+                44, 51, 0,
+                51, 52, 52, # shrub/scrub
+                52, 70, 0,
+                70, 71, 71, # herbaceous
+                71, 80, 0, 
+                80, 81, 81, # hay/pasture
+                81, 82, 82, # cultivated crops
+                82, 89, 0,
+                89, 90, 90, # woody wetlands
+                90, 94, 0,
+                94, 95, 95, # emerging herbaceous wetlands
+                95, 255, 0)
+
+# reshape the object into a matrix with columns and rows
+reclass_m <- matrix(reclass_df,
+                ncol = 3,
+                byrow = TRUE)
+# perfrom the reclassification
+nlcd <- reclassify(nlcd, reclass_m)
+# set a min and max value for the raster
+nlcd <- setMinMax(nlcd)
+```
+
+#### Processing Precipitation Data
+
+The precipitation raster is from PRISM at the University of Oregon, and displays total annual precipitation from 2020 for entire continental US at and 800m X 800m grid level. The raster is cropped to Butte County and then projected to the coordinate system of the fishnet.
+
+```{r clean precip data}
+precip_temp <- raster('data/precipitation/PRISM_ppt_stable_4kmM3_2020_bil/PRISM_ppt_stable_4kmM3_2020_bil.bil')
+precip <- precip_temp %>% crop(y = netBorder %>% st_transform(crs(precip_temp)))
+rm(precip_temp)
+precip[is.na(precip)] <- 0
+precip <- setMinMax(precip)
+```
+
+#### Fire Hazard data
+
+```{r clean fire hazard raster data}
+hazard_temp <- raster('data/hazard_score.tif')
+hazard <- hazard_temp %>% crop(y = butte %>% st_transform(crs(hazard_temp)))
+rm(hazard_temp)
+hazard[is.na(hazard)] <- 0
+hazard <- setMinMax(hazard)
+```
+
+#### Processing USGS Elevation Data
+
+Elevation data for the entire contiguous 48 states is available from the USGS. The data used here are three tiles from the 3D Elevation Program (3DEP) and are 1 arc-second (approximately 30 m) resolution.
+
+```{r merge elevation data}
+a <- raster("data/USGS_1_n40w122_20210301.tif")
+b <- raster("data/USGS_1_n40w123_20210301.tif")
+c <- raster("data/USGS_1_n41w122_20210624.tif")
+
+butteElev <- as.list(a, b, c)
+butteElev$filename <- 'test.tif'
+butteElev$overwrite <- TRUE
+abc <- do.call(merge, butteElev)
+
+elevation <- abc %>% crop(y = butte %>% st_transform(crs(abc)))
+```
+
+### Vector Data
+
+Discuss data sources used, etc.
+
+#### Wildfire Extents
+
+This layer maps the boundaries of previous wildfires
+
+```{r wildfire extents, include = TRUE, warning = FALSE, message = FALSE}
+fires <- st_read("shapes/fires.shp") %>%
+  dplyr::filter(YEAR_ %in% range(2018:2020))
+fires <- fires %>%
+  mutate(valid = st_is_valid(fires)) %>%
+  st_as_sf() %>%
+  dplyr::filter(valid == TRUE) # %>%
+  # st_transform('ESRI:102642') %>%
+  # st_intersection(., fishnet)
+```
+
+## Aggregate Data to Fishnet
+
+### Wildfire Extent
+
+The wildfire extent data between 2018 and 2020 will be used to create the dependent variable in this model, the variable we are seeking to predict. We want to understand if a given fishnet cell burned or not during the time period we are investigating
+
+Discuss the choice of time period. Talk about "re-burn" cycles, and how that is impacted by elevation (higher frequency adapted trees that grow quickly seed during fire).
+
+```{r create dependent variable, include = TRUE, warning = FALSE, message = FALSE}
+burned <- st_intersection(fishnet, fires %>% dplyr::select(YEAR_, FIRE_NAME, CAUSE) %>%
+                            st_transform(st_crs(fishnet)))
+
+burned$burn_area <- as.numeric(st_area(burned$geometry))
+
+# calculate the ratio of fire coverage in the cells where fire was recorded, then filter for just those cells that were more than 85% burned.
+burned <- burned %>%
+  group_by(uniqueID) %>%
+  summarise(burn_ratio = sum(burn_area)/6969600) %>%
+  st_drop_geometry() %>%
+  dplyr::filter(burn_ratio > .85) %>%
+  mutate(burned = 1)
+
+overOne <- burned %>%
+  dplyr::filter(burn_ratio > 1)
+
+fishnet <- fishnet %>% left_join(., burned, by = c("uniqueID" = "uniqueID"))
+fishnet[is.na(fishnet)] <- 0
+fishnet$burned <- as.factor(fishnet$burned)
+
+# some of the cells recorded two fires, but without further investigation it is difficult to understand if the fires overlap, or if there are two non-overlapping extents within the cell. For now the model will only be binary, burned or not, over the three years. The model may need to use a single year of data or somehow consider a different timeline. Cross validation across years will be a necessity.
+```
+
+### Land Cover Data
+
+```{r aggregate land cover, include = TRUE, warning = FALSE, message = FALSE}
+fishnet <- cbind(fishnet, exact_extract(nlcd, 
+                                        fishnet %>% st_transform(crs(nlcd)), 
+                                        'mode'))
+fishnet <- fishnet %>%
+  rename(landcover = exact_extract.nlcd..fishnet.....st_transform.crs.nlcd.....mode..)
+```
+
+### Elevation Data
+
+```{r aggregate elevation, include = TRUE, warning = FALSE, message = FALSE}
+fishnet <- cbind(fishnet, exact_extract(elevation,
+                                        fishnet %>% st_transform(crs(elevation)),
+                                        'mean'))
+fishnet <- fishnet %>%
+  rename(elevation = exact_extract.elevation..fishnet.....st_transform.crs.elevation....)
+```
+
+### Precipitation Data
+
+```{r aggregate precipitation, include = TRUE, warning = FALSE, message = FALSE}
+fishnet <- cbind(fishnet, exact_extract(precip,
+                                        fishnet %>% st_transform(crs(precip)),
+                                        'mean'))
+fishnet <- fishnet %>%
+  rename(precip = exact_extract.precip..fishnet.....st_transform.crs.precip....)
+```
+
+### Fire Hazard Score Data
+
+```{r aggregate fire hazard score, include = TRUE, warning = FALSE, message = FALSE}
+fishnet <- cbind(fishnet, exact_extract(hazard,
+                                        fishnet %>% st_transform(crs(hazard)),
+                                        'mode'))
+fishnet <- fishnet %>%
+  rename(hazard = exact_extract.hazard..fishnet.....st_transform.crs.hazard....)
+```
+
+### Final Feature Adjustments
+
+```{r final feature adjustments, include = TRUE, warning = FALSE, message = FALSE}
+fishnet <- fishnet %>%
+  mutate(landcover = as.factor(landcover), hazard = as.factor(hazard)) %>%
+  rename(lc_num = landcover) %>%
+  mutate(landcover = case_when(lc_num == "11" ~ "water",
+                               lc_num == "12" ~ "snow_ice",
+                               lc_num == "21" ~ "dvlpd_open",
+                               lc_num == "22" ~ "dvlpd_low",
+                               lc_num == "23" ~ "dvlpd_med",
+                               lc_num == "24" ~ "dvlpd_hi",
+                               lc_num == "31" ~ "barren",
+                               lc_num == "41" ~ "deciduous",
+                               lc_num == "42" ~ "evergreen",
+                               lc_num == "43" ~ "mixed",
+                               lc_num == "52" ~ "shrub",
+                               lc_num == "71" ~ "herbaceous",
+                               lc_num == "81" ~ "pasture",
+                               lc_num == "82" ~ "crops",
+                               lc_num == "90" ~ "woody_wtlnd",
+                               lc_num == "95" ~ "herb_wtlnd")) %>%
+  mutate(landcover = make.names(landcover))
+
+fishnet <- fishnet %>%
+  mutate(burned_chr = case_when(burned == "0" ~ "not",
+                                burned == "1" ~ "burned")) %>%
+  as.factor()
+```
+
+# Predictive Model
+
+Now that the data is processed, a model can be constructed. Because we are predicting a binary outcome, a General Linear Model of the Binomial type ("logit")
+
+## Build Model
+
+### Partition Data and Set up Model
+
+```{r partition and set up model, include = TRUE}
+# create separate train index and test index
+set.seed(3456)
+trainIndex <- createDataPartition(fishnet$burned, 
+                                  p = .70,
+                                  list = FALSE,
+                                  times = 1)
+burnTrain <- fishnet[ trainIndex,]
+burnTest <- fishnet[-trainIndex,]
+
+reg1 <- glm(burned ~ .,
+            data = as.data.frame(burnTrain) %>% 
+              dplyr::select(-uniqueID, -burn_ratio, -lc_num, -hazard, -burned_chr, -geometry),
+            family="binomial"(link="logit"))
+summary(reg1)
+```
+
+Check the McFadden R-squared.
+
+```{r fit_metrics}
+pR2(reg1)
+```
+
+## Model Predictions
+
+
+```{r testProbs}
+testProbs = data.frame(Outcome = as.factor(burnTest$burned),
+                        Probs = predict(reg1, burnTest, type= "response"))
+```
+
+```{r plot_testProbs}
+ggplot(testProbs, aes(x = Probs, fill = as.factor(Outcome))) + 
+  geom_density() +
+  facet_grid(Outcome ~ .) +
+  scale_fill_manual(values = palette2) +
+  geom_vline(xintercept = .25) +
+  labs(x = "Burned", y = "Density of probabilities",
+       title = "Distribution of predicted probabilities by observed outcome",
+       subtitle = "Likelihood of Wildfire") +
+  plotTheme() + 
+  theme(strip.text.x = element_text(size = 18),
+        legend.position = "none")
+```
+
+# Model Validation
+
+The probability distributions by observed outcome look to be organized at opposite ends of the probability scale, as we would hope to see. However, there are methods to further explore the model's performance and generalizability. 
+
+## Goodnes of Fit
+
+By setting an outcome threshold based on a visual inspection of the test set probabilities, we can assign a prediction outcome to grid cell in the test set. The 25% threshold seems like a reasonable starting point, but we will seek to optimize that threshold in time.
+
+```{r predicted outcomes}
+testProbs <- testProbs %>%
+  mutate(predOutcome  = as.factor(ifelse(testProbs$Probs > 0.25 , 1, 0)))
+```
+
+We should have a lot of discussion here about why the confusion matrix matters. We want to minimize predictions of "not-burning" when in actuality an area burned.
+
+```{r confusion matrix}
+caret::confusionMatrix(testProbs$predOutcome, testProbs$Outcome, 
+                       positive = "1")
+```
+
+```{r area under curve}
+auc(testProbs$Outcome, testProbs$Probs)
+```
+
+```{r ROC}
+ggplot(testProbs, aes(d = as.numeric(Outcome), m = Probs)) +
+  geom_roc(n.cuts = 50, labels = FALSE, colour = "#FE9900") +
+  style_roc(theme = theme_grey) +
+  geom_abline(slope = 1, intercept = 0, size = 1.5, color = 'grey') +
+  labs(title = "ROC Curve - churnModel")
+```
+
+## Cross Validation
+
+based on the "churn" case from Chapter 6 in Public Policy Analytics
+
+```{r cross validation}
+ctrl <- trainControl(method = "cv", number = 100, classProbs=TRUE, summaryFunction=twoClassSummary)
+
+cvFit <- train(burned_chr ~ ., data = st_drop_geometry(fishnet) %>% 
+                                   na.omit() %>%
+                                   dplyr::select(
+                                     burned_chr,
+                                     elevation,
+                                     precip,
+                                     landcover), 
+                method="glm", family="binomial",
+                metric="ROC", trControl = ctrl)
+
+cvFit
+```
+
+```{r CV_dist}
+dplyr::select(cvFit$resample, -Resample) %>%
+  gather(metric, value) %>%
+  left_join(gather(cvFit$results[2:4], metric, mean)) %>%
+  ggplot(aes(value)) + 
+    geom_histogram(bins=35, fill = "#FF006A") +
+    facet_wrap(~metric) +
+    geom_vline(aes(xintercept = mean), colour = "#981FAC", linetype = 3, size = 1.5) +
+    scale_x_continuous(limits = c(0, 1)) +
+    labs(x="Goodness of Fit", y="Count", title="CV Goodness of Fit Metrics",
+         subtitle = "Across-fold mean reprented as dotted lines") +
+    plotTheme()
+```
