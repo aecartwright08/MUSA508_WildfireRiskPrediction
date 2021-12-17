@@ -1,0 +1,804 @@
+---
+title: "Wildfire Risk Prediction"
+author: "Alex Cartwright & Max Masuda-Farkas"
+date: "12/17/2021"
+output:
+  rmarkdown::html_document:
+    theme: cosmo
+    toc: true
+    toc_float: TRUE
+    number_sections: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(include = TRUE, warning=FALSE)
+
+options(scipen = 999)
+
+library(tidyverse)
+library(lubridate)
+library(sf)
+library(raster)
+library(rgdal)
+library(exactextractr)
+library(viridis)
+library(raster)
+library(spdep)
+library(pscl)
+library(caret)
+library(yardstick)
+library(grid)
+library(gridExtra)
+library(knitr)
+library(kableExtra)
+library(tidycensus)
+library(plotROC)
+library(pROC)
+library(stargazer)
+library(yardstick)
+library(scales)
+
+land_palette <- c("#b6ad90","#bcb8b1","#588157","#2d6a4f","#fff3b0","#d4e09b","#f1dca7","#ba181b","#118ab2")
+palette5 <- c("#533747","#5F506B","#6A6B83","#76949F","#86BBBD")
+palette4 <- c("#533747","#5F506B","#76949F","#86BBBD")
+palette2 <- c("#76949F", "#fb8500")
+```
+
+```{r load_functions, include = FALSE}
+# functions
+root.dir = "https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/DATA/"
+source("https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/functions.r")
+
+# a function to determine the statistical mode of a variable
+mode <- function(codes){
+  which.max(tabulate(codes))
+}
+
+# Revised Cross-validate function from chapter 5 (left in chapter)
+crossValidate <- function(dataset, id, dependentVariable, indVariables) {
+  
+  allPredictions <- data.frame()
+  cvID_list <- unique(dataset[[id]])
+  
+  for (i in cvID_list) {
+    
+    thisFold <- i
+    cat("This hold out fold is", thisFold, "\n")
+    
+    fold.train <- filter(dataset, dataset[[id]] != thisFold) %>% as.data.frame() %>% 
+      dplyr::select(id, geometry, indVariables, dependentVariable)
+    fold.test  <- filter(dataset, dataset[[id]] == thisFold) %>% as.data.frame() %>% 
+      dplyr::select(id, geometry, indVariables, dependentVariable)
+    
+    regression <- glm(paste0(dependentVariable,"~."), family = "poisson", 
+    data = fold.train %>% dplyr::select(-geometry, -id))
+    
+    thisPrediction <- 
+      mutate(fold.test, Prediction = predict(regression, fold.test, type = "response"))
+    
+    allPredictions <-
+      rbind(allPredictions, thisPrediction)
+    
+  }
+  return(st_sf(allPredictions))
+}
+
+# #this function convert a raster to a data frame so it can be plotted in ggplot
+rast <- function(inRaster) {
+  data.frame(
+    xyFromCell(inRaster, 1:ncell(inRaster)),
+    value = getValues(inRaster)) }
+```
+
+# Motivation
+
+When a catastrophic wildfire levels an entire town as the historic Camp Fire did to Paradise, CA in 2018, the losses extend well beyond financial costs. To be sure, these costs are enormous, sometimes even unimaginable. But more unimaginable is the damage done to the people who once inhabited the town and the lives that are destroyed along with it.
+
+As catastrophic wildfires become more frequent as a result of climate change, governments have an obligation to use every resource at their disposal to mitigate damages both tangible and intangible. Given that public resources are always in short supply, every dollar spent must be targeted where it is most needed. Governments cannot afford to use ad hoc, reactive decision-making when dealing with a problem as grave and growing as the threat of wildfires. A proactive approach is needed.
+
+To that end, Spothot has designed a machine learning algorithm that predicts where wildfires are likeliest to occur at a given time. Armed with Spothot’s algorithm, governments can know in advance the areas they must target for preventive measures before wildfires occur. This report will explain what data are used in Spothot’s model, how the model works and how accurate it is, and what steps remain before full deployment. 
+
+Enjoy this [video](https://youtu.be/m_6XU8Rqlg4) of a quick presentation of this project.
+
+# Data
+
+## Initial Data Processing
+
+Several data types and sources are used to construct this model, in both vector and raster form. The data include CAL FIRE administrative units, historical wildfire extents, land cover classes, elevation, and annual precipitation totals. These data and the methods used in the intial wrangling of them are discussed in the following sections.
+
+### Fishnet: Butte County, California Fire District
+
+CAL FIRE has 21 operational units that are designed to address fire suppression over their geographic area. Each unit engages with a wide gamut of fire-related duties, from education, to fuel removal, to emergency response. The data are vector polygons that define the exten of each unit's jurisdiction, and can be retrieved from the California Open Data Portal [here](https://data.ca.gov/dataset/cal-fire-administrative-units1). 
+
+```{r read_fire_data, results = 'hide', include = TRUE, warning = FALSE, message = FALSE}
+# project to NAD 1983 StatePlane California II FIPS 0402 Feet (ESRI:102642)
+butte <- st_read("shapes/CAL_FIRE_Administrative_Units.shp") %>%
+  st_transform('ESRI:102642') %>% dplyr::filter(UNIT == "Butte Unit")
+```
+
+For this analysis we focused on the Butte County fire district. The district extent is used to create a spatial grid, referred to here forth as the fishnet, that all of the engineered features will be bound to, allowing for the spatial regression required to construct the predictive risk model. The fishnet cells are created such that each has an area of 0.5 square miles.
+
+```{r create_fishnet, include = TRUE, warning = FALSE, message = FALSE}
+## using {sf} to create the grid
+## Note the `.[butte] %>% ` line. This is needed to clip the grid to our area
+fishnet <- 
+  st_make_grid(butte,
+               cellsize = 2837, # 2837 center to center for hexagon# 2640 for a square 
+               square = FALSE) %>%
+  .[butte] %>%            # <- MDH Added
+  st_sf() %>%
+  mutate(uniqueID = rownames(.))
+
+netBorder <- st_union(fishnet) %>% st_as_sf()
+
+ggplot() +
+  geom_sf(data = fishnet, fill = "black", color = "white", stroke = 0.1) +
+  labs(title = "Fishnet, 0.5 sq.mi. area per cell",
+       subtitle = "Butte County, CA Fire District") +
+  mapTheme()
+```
+
+### Raster Data
+
+#### NLCD Land Cover data
+
+The most fundamental data source in this model is land cover data. It was retrieved from the [Multi-Resolution Land Characteristics Consortium](https://www.mrlc.gov/data), and is National Land Cover Database satellite imagery of the continental US from 2019 with a resolution of 30 ft by 30 ft. The raster is cropped to the extent of the fishnet and reclassified so that all pixel values that do not correspond to a NLCD land cover classification are given a value of 0.
+
+```{r clean NCLD land cover raster data}
+nlcd_temp <- raster('data/landCover/nlcd_2019_land_cover_l48_20210604.img')
+nlcd <- nlcd_temp %>% crop(y = butte %>% st_transform(crs(nlcd_temp)))
+rm(nlcd_temp)
+
+# reclassify the NLCD data - just an example from CPLN675, might need to do it different
+
+# create a dataframe defining the classifications // the upper value of a range is inclusive
+reclass_df <- c(0, 10, 0,
+                10, 11, 11, # open water
+                11, 12, 12, # perennial snow/ice
+                12, 20, 0,
+                20, 21, 21, # developed, open space
+                21, 22, 22, # developed, low intensity
+                22, 23, 23, # developed, med intensity
+                23, 24, 24, # developed, high intensity
+                24, 30, 0,
+                30, 31, 31, # barren
+                31, 40, 0,
+                40, 41, 41, # deciduous forest
+                41, 42, 42, # evergreen forest
+                42, 43, 43, # mixed forest
+                44, 51, 0,
+                51, 52, 52, # shrub/scrub
+                52, 70, 0,
+                70, 71, 71, # herbaceous
+                71, 80, 0, 
+                80, 81, 81, # hay/pasture
+                81, 82, 82, # cultivated crops
+                82, 89, 0,
+                89, 90, 90, # woody wetlands
+                90, 94, 0,
+                94, 95, 95, # emerging herbaceous wetlands
+                95, 255, 0)
+
+# reshape the object into a matrix with columns and rows
+reclass_m <- matrix(reclass_df,
+                ncol = 3,
+                byrow = TRUE)
+# perfrom the reclassification
+nlcd <- reclassify(nlcd, reclass_m)
+# set a min and max value for the raster
+nlcd <- setMinMax(nlcd)
+```
+
+#### Processing Precipitation Data
+
+The precipitation raster is from [PRISM](https://prism.oregonstate.edu/recent/monthly.php) Climate Group at Oregon State University, and displays the total annual precipitation from 2019 for the continental US at an 800m X 800m grid level. The raster is cropped to the fishnet extent and then projected to the coordinate system of the fishnet.
+
+```{r clean precip data}
+precip_temp <- raster('data/precipitation/PRISM_ppt_stable_4kmM3_2019_bil/PRISM_ppt_stable_4kmM3_2019_bil.bil')
+precip <- precip_temp %>% crop(y = netBorder %>% st_transform(crs(precip_temp)))
+rm(precip_temp)
+precip[is.na(precip)] <- 0
+precip <- setMinMax(precip)
+# 2020 precipitation data
+precip_temp <- raster('data/precipitation/PRISM_ppt_stable_4kmM3_2020_bil/PRISM_ppt_stable_4kmM3_2020_bil.bil')
+precip20 <- precip_temp %>% crop(y = netBorder %>% st_transform(crs(precip_temp)))
+rm(precip_temp)
+precip20[is.na(precip20)] <- 0
+precip20 <- setMinMax(precip20)
+```
+
+#### Processing USGS Elevation Data
+
+Elevation data for the entire contiguous 48 states is available from the [USGS](https://apps.nationalmap.gov/downloader/#/). The data used here are three tiles from the 3D Elevation Program (3DEP) at 1 arc-second (approximately 30 m) resolution that make up the extent of the Butte County fire district. The tiles must are merged together prior to any further association with the fishnet.
+
+```{r merge elevation data}
+a <- raster("data/USGS_1_n40w122_20210301.tif")
+b <- raster("data/USGS_1_n40w123_20210301.tif")
+c <- raster("data/USGS_1_n41w122_20210624.tif")
+
+butteElev <- as.list(a, b, c)
+butteElev$filename <- 'test.tif'
+butteElev$overwrite <- TRUE
+abc <- do.call(merge, butteElev)
+
+elevation <- abc %>% crop(y = butte %>% st_transform(crs(abc)))
+```
+
+### Vector Data
+
+#### Wildfire Extent
+
+This historical wildfire extent layer from the Fire and Resource Assessment Program maps the boundaries of previous wildfires by date to the specificity of year/month/day. This layer was retrieved from the California Open Data [portal](https://frap.fire.ca.gov/frap-projects/fire-perimeters/). Wildfires that started in 2018, 2019, and 2020 are selected to be intersected with the fishnet later. The month the fire started is collected as well for investigation of possible yearly temporal clustering later in the analysis.
+
+```{r wildfire extents, results = 'hide', include = TRUE, warning = FALSE, message = FALSE}
+fires <- st_read("shapes/fires.shp") %>%
+  dplyr::select(YEAR_, FIRE_NAME, ALARM_DATE) %>%
+  rename(year = YEAR_) %>%
+  mutate(year = as.numeric(year)) %>%
+  dplyr::filter(year == 2018 | year == 2019 | year == 2020) %>%
+  mutate(month = month(ALARM_DATE))
+fires <- fires %>%
+  mutate(valid = st_is_valid(fires)) %>%
+  st_as_sf() %>%
+  dplyr::filter(valid == TRUE)
+```
+
+## Aggregate Data to Fishnet
+
+With the pre-processing handled, the wrangling phase can move to the process of any additional feature engineering and binding the features to the fishnet for use in the regression.
+
+### Wildfire Extent
+
+The wildfire extent data between 2018 and 2020 is used to create the dependent variable in the logit regression of this model. We want to understand the influence of the engineered features on whether a given fishnet cell burned or not over this three year time frame so the features can be used to predict whether an area in Butte County is likely to burn in the next year.
+
+There is [research](https://pubmed.ncbi.nlm.nih.gov/27859087/) that investigates the frequency of re-burn and factors that influence the frequency, including burn severity and elevation. This model does not preclude a region from "burning again" if it was observed to have burned in the historical extents, primarily because the fire extent data set does not have information regarding burn severity, only extent, which are not the same metrics. It is a goal of this project to expand the model's understanding of successive wildfire dynamics in order to provide the most effective risk predictions possible, but that will be a subsequent study unto its own.
+
+In this analysis, a given grid cell is considered to have been "burned" if a wildfire's extent covers more than 85% of the cell's area.
+
+```{r create dependent variables, results = 'hide', include = TRUE, warning = FALSE, message = FALSE}
+burned <- 
+  st_intersection(fishnet, fires %>% dplyr::select(year, month, FIRE_NAME) %>%
+                            st_transform(st_crs(fishnet)))
+
+burned$burn_area <- as.numeric(st_area(burned$geometry))
+
+# calculate the ratio of fire coverage in the cells where fire was recorded, then filter for just those cells that were more than 85% burned.
+
+burned <- burned %>%
+  group_by(uniqueID) %>%
+  summarise(burn_ratio = sum(burn_area)/6969600) %>%
+  st_drop_geometry() %>%
+  dplyr::filter(burn_ratio > .85) %>%
+  mutate(burned = 1)
+
+fishnet <- fishnet %>% left_join(., burned, by = c("uniqueID" = "uniqueID"))
+fishnet[is.na(fishnet)] <- 0
+fishnet$burned <- as.factor(fishnet$burned)
+```
+
+### Aggregate raster data to the fishnet
+
+The raster data (land cover, elevation, precipitation) is bound to the fishnet cells through zonal statistics operations. The land cover data is assigned using a modal operation, whereby the land cover type that occupies the most area within a given cell is the type assigned to the cell. The elevation and precipitation data assign the average value contained within a given cell.
+
+```{r aggregate raster data, results = 'hide', include = TRUE, warning = FALSE, message = FALSE}
+fishnet <- cbind(fishnet, exact_extract(nlcd, 
+                                        fishnet %>% st_transform(crs(nlcd)), 
+                                        'mode'))
+
+fishnet <- cbind(fishnet, exact_extract(elevation,
+                                        fishnet %>% st_transform(crs(elevation)),
+                                        'mean'))
+
+fishnet <- cbind(fishnet, exact_extract(precip,
+                                        fishnet %>% st_transform(crs(precip)),
+                                        'mean'))
+
+fishnet <- cbind(fishnet, exact_extract(precip20,
+                                        fishnet %>% st_transform(crs(precip20)),
+                                        'mean'))
+
+fishnet <- fishnet %>%
+  rename(landcover = exact_extract.nlcd..fishnet.....st_transform.crs.nlcd.....mode..) %>%
+  rename(elevation = exact_extract.elevation..fishnet.....st_transform.crs.elevation....) %>%
+  rename(precip = exact_extract.precip..fishnet.....st_transform.crs.precip....) %>%
+  rename(precip20 = exact_extract.precip20..fishnet.....st_transform.crs.precip20....)
+rm(nlcd)
+```
+
+### Final Feature Adjustments
+
+The numerical land cover values are used to create a new feature of descriptive land cover classes that will serve as a factor variable in the regression. Lastly, a character version of the binary 0/1 dependent variable is created, "not"/"burned", that is used in the model validation process.
+
+```{r final feature adjustments, include = TRUE, warning = FALSE, message = FALSE}
+fishnet <- na.omit(fishnet)
+fishnet <- fishnet %>%
+  mutate(landcover = as.factor(landcover)) %>%
+  rename(lc_num = landcover) %>%
+  mutate(landcover = case_when(lc_num == "11" ~ "water",
+                               lc_num == "12" ~ "snow_ice",
+                               lc_num == "21" ~ "dvlpd_open",
+                               lc_num == "22" ~ "dvlpd_low",
+                               lc_num == "23" ~ "dvlpd_med",
+                               lc_num == "24" ~ "dvlpd_hi",
+                               lc_num == "31" ~ "barren",
+                               lc_num == "41" ~ "deciduous",
+                               lc_num == "42" ~ "evergreen",
+                               lc_num == "43" ~ "mixed",
+                               lc_num == "52" ~ "shrub",
+                               lc_num == "71" ~ "herbaceous",
+                               lc_num == "81" ~ "pasture",
+                               lc_num == "82" ~ "crops",
+                               lc_num == "90" ~ "woody_wtlnd",
+                               lc_num == "95" ~ "herb_wtlnd")) %>%
+  mutate(landcover = make.names(landcover)) %>%
+  mutate(landcover = as.factor(landcover))
+
+fishnet <- fishnet %>%
+  mutate(burned_chr = case_when(fishnet$burned == "0" ~ "not",
+                                fishnet$burned == "1" ~ "burned")) %>%
+  dplyr::select(-burn_ratio)
+```
+
+## Exploratory Analysis
+
+### Spatial Arrangements
+
+The land cover patterns within Butte County Fire District are mapped on the fishnet in the following plot.
+
+```{r landcover map}
+ggplot() +
+  geom_sf(data = fishnet, aes(fill = landcover), colour = NA) +
+  scale_fill_manual(values = c("water" = "#00b4d8",
+                               "snow_ice" = "#ade8f4",
+                               "dvlpd_open" = "#dee2e6",
+                               "dvlpd_low" = "#ced4da",
+                               "dvlpd_med" = "#adb5bd",
+                               "dvlpd_hi" = "#6c757d",
+                               "barren" = "#e6ccb2",
+                               "deciduous" = "#606c38",
+                               "evergreen" = "#283618",
+                               "mixed" = "#80b918",
+                               "shrub" = "#bb9457",
+                               "herbaceous" = "#b9fbc0",
+                               "pasture" = "#efe9ae",
+                               "crops" = "#ffcb69",
+                               "woody_wtlnd" = "#a9d6e5",
+                               "herb_wtlnd" = "#80ffdb")) +
+  labs(title = "Land Cover in Butte County") +
+  mapTheme()
+```
+
+The two continuous variables are mapped on the fishnet below.
+
+```{r continuous var maps, include = TRUE}
+precip_map <-
+  ggplot() +
+  geom_sf(data = fishnet, aes(fill = precip), colour = NA) +
+  scale_fill_viridis(option = 'mako', direction = -1) +
+  labs(subtitle = "Precipitation") +
+  mapTheme()
+
+elev_map <-
+  ggplot() +
+  geom_sf(data = fishnet, aes(fill = elevation), colour = NA) +
+  scale_fill_viridis(option = "inferno") +
+  labs(subtitle = "Elevation") +
+  mapTheme()
+
+grid.arrange(precip_map, elev_map, ncol = 2,
+             top=textGrob("Spatial arrangments of continuous features",gp=gpar(fontsize=18)))
+```
+
+Intuition and a general familiarity with fire led us to the selection of the data used to create the variables in this model, but some exploratory analysis of the relationships with our objective dependent variable will serve to check the data applicability and possibly guide additional feature engineering.
+
+By plotting the count of burned cells that correspond with each land cover type we can gauge whether certain land cover types are more related to where wildfires occur, or more prone to burning.
+
+```{r factor variable hist, include = TRUE}
+fishnet %>%
+  st_drop_geometry() %>%
+  dplyr::select(burned, landcover) %>%
+  gather(Variable, value, -burned) %>%
+  count(Variable, value, burned) %>%
+  ggplot(aes(value, n, fill = burned)) +   
+    geom_bar(position = "dodge", stat="identity") +
+    facet_wrap(~Variable, scales="free") +
+    scale_fill_manual(values = palette2) +
+    labs(x="Burned", y="Count",
+         title = "Feature associations with the likelihood of burning",
+         subtitle = "Categorical features") +
+    plotTheme() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+The relationships between the two continuous variables, precipitation and elevation, can be plotted similarly.
+
+```{r continuous variable hist, include = TRUE}
+fishnet %>%
+  st_drop_geometry() %>%
+  dplyr::select(burned, precip, elevation) %>%
+  gather(Variable, value, -burned) %>%
+  ggplot(aes(burned, value, fill=burned)) + 
+    geom_bar(position = "dodge", stat = "summary", fun = "mean") + 
+    facet_wrap(~Variable, scales = "free") +
+    scale_fill_manual(values = palette2) +
+    labs(x="Burned", y="Mean") +
+    plotTheme() + theme(legend.position = "none")
+```
+### Spatial Process
+
+Based on this exploratory analysis we can conclude that the spatial process of wildfire burn is correlated with higher elevations, which are locations of higher precipitation in Butte County, as well as the presence of evergreen and herbaceous land cover.
+
+# Predictive Model
+
+A binomial general linear model is used , also known as a logit model. This type of model predicts for a binary outcome—in this case, whether in the next year an area will “burn” or “not burn.” For the sake of reliability, regressions are tailored to individual years from the last three so that there are separate regressions for 2018, 2019, and 2020. 
+
+## Build Model
+
+### Partition Data and Set up Model
+
+The fishnet is partitioned with a 70/30 split into a training set and test set. The test set is reserved to check the predictive power of the model after it is trained on the training set.
+
+The following summary table indicates the statistical significance of each variable in the model. The two continuous variables were highly significant, while the land cover categorical variable appears to be less significant. However, the model performs very poorly without the land cover data, suggesting that the statistical significance of the individual categories is not crucial to an effective model.
+
+```{r partition and set up models, include = TRUE}
+# create separate train index and test index
+set.seed(3456)
+
+# 2018 through 2020 model
+trainIndex <- createDataPartition(y = paste(fishnet$burned, fishnet$landcover), 
+                                  p = .70,
+                                  list = FALSE,
+                                  times = 1)
+burnTrain <- fishnet[ trainIndex,]
+burnTest <- fishnet[-trainIndex,]
+
+reg <- glm(burned ~ .,
+            data = as.data.frame(burnTrain) %>% 
+              dplyr::select(burned, landcover, precip, elevation),
+            family="binomial"(link="logit"))
+
+summary(reg)
+```
+
+A logit model does not have a true R-squared metric, but a pseudo R-squared metric, called McFadden R-squared, provides an indication of how much variance is explained by the model. In this case, the result is about .44, which is higher than the 0.2 - 0.4 range of "excellent" fit as specified by the creator of the metric, Daniel McFadden.
+
+```{r fit_metrics_combined, message = FALSE}
+pR2(reg)
+```
+
+## Model Predictions
+
+The probabilities of the test set cells burning are predicted using the trained model. The distribution of the test set probabilities, separated by the actual observed outcome, is shown in the following plot. There is clear separation between the probabilities of cells that were observed to have not burned (low probability) compared to those cells that were observed to have burned (high probabilities).
+
+The point of preparing a visualization of this distribution is to illustrate the overlap between the probabilities related to the two outcomes. A vertical line is placed at 25% probability which seems to mark a transition from high density of low probability observations to low density of low probability observations. However, the choice of this "outcome threshold" will have important consequences on those impacted by this model's use, as will be illustrated in the following model validation process.
+
+```{r testProbs}
+testProbs = data.frame(Outcome = as.factor(burnTest$burned),
+                        Probs = predict(reg, burnTest, type= "response"))
+```
+
+```{r plot_testProbs}
+  ggplot(testProbs, aes(x = Probs, fill = as.factor(Outcome))) + 
+    geom_density() +
+    facet_grid(Outcome ~ .) +
+    scale_fill_manual(values = palette2) +
+    geom_vline(xintercept = .25) +
+    labs(x = "Burned", y = "Density of probabilities",
+         title = "Distribution of predicted probabilities by observed Outcome",
+         subtitle = "Likelihood of Wildfire, 2018-2020") +
+    plotTheme() + 
+    theme(strip.text.x = element_text(size = 18),
+          legend.position = "none")
+```
+
+# Model Validation
+
+Building a model that spits out a probability of an event is only the first step in creating a useful tool. The model must be validated to understand whether it is able predict well in a variety of spatial subsets, i.e. whether the model generalizes across space. Further, depending on the intended use of the model, there may be differing optimal outcome thresholds. A methodology to weigh the costs and benefits of where that threshold is set will help maximize the model's utility.
+
+## Goodnes of Fit
+
+The outcome threshold is set at 25% based on the visual inspection of the test set probabilities. A predicted outcome for each cell in the test set is calculated according to which side of that threshold its probability falls on.
+
+```{r pred outcomes}
+testProbs <- testProbs %>%
+  mutate(predOutcome  = as.factor(ifelse(testProbs$Probs > 0.25 , 1, 0)))
+```
+
+### The four outcomes
+
+To understand the distribution of combinations of predicted and observed outcomes, we use a confusion matrix, which presents the number of true positives, true negatives, false positives, and false negatives. The confusion matrix calculates an overall accuracy, which is a ratio of correct predictions to total observations, but does not provide the nuance we need to improve our decision making.
+
+The confusion matrix also provides the sensitivity and specificity of the predictions on the test set, which are the true positive rate and true negative rate. These are essentially the contributing factors to overall accuracy, but separated for more clarity. A high sensitivity is definitely a priority of this model, as we want to correctly predict that a location will burn. Yet the most crucial metric in a wildfire risk model is minimizing the amount of false negatives, where a burned area is incorrectly predicted as not burned - this is the scenario that will impact life and property.
+
+With this outcome threshold we have a sensitivity of around .88 and a specificity of around .82, both of which are high and relatively equal. It seems feasible that we could sacrifice some of the specificity for additional sensitivity depending on the cost required to do so.
+
+```{r confusion matrix}
+caret::confusionMatrix(testProbs$predOutcome, testProbs$Outcome, 
+                       positive = "1")
+```
+
+```{r viz confusion matrix, message = FALSE, error = FALSE, warning = FALSE}
+cm <- conf_mat(testProbs, Outcome, predOutcome)
+autoplot(cm, type = "heatmap") +
+  scale_fill_gradient(low="#d8f3dc",high = "#81b29a") +
+  labs(title = "Confusion Matrix")
+```
+
+### ROC
+
+The receiver operator curve (ROC) is another graphic tool that lets us visualize the trade-offs between model outcomes based on the outcome threshold. The more the curve moves away above the 50/50 line, the better the model fits the data. However, there is a limit, in that a model can be over fit to the data, which would look like a sharp 90 degree angle. The ideal result lies somewhere in between. The area under the curve for the model is shown below, followed by the ROC. In this case, the area under the curve is slightly above an ideal range of .65 - .85, but it is not overly concerning and indicative of an over fit model.
+
+```{r area under curve, message = FALSE, error = FALSE, warning = FALSE}
+auc(testProbs$Outcome, testProbs$Probs)
+```
+
+```{r ROC, message = FALSE, error = FALSE, warning = FALSE}
+ggplot(testProbs, aes(d = as.numeric(testProbs$Outcome), m = Probs)) +
+  geom_roc(n.cuts = 50, labels = FALSE, colour = "#81b29a") +
+  style_roc(theme = theme_grey) +
+  geom_abline(slope = 1, intercept = 0, size = 1.5, color = 'grey') +
+  labs(title = "ROC Curve") +
+  plotTheme()
+```
+
+## Random Spatial Cross Validation
+
+As discussed, we need to understand how the model performs in a variety of contexts, or whether it is generalizable. We perform k-fold random cross validation which predicts on 100 random subgroups of the model, and then we gather the ROC, Sensitivity, and Specificity results to gauge whether the model generalizes well in a random grouping.
+
+```{r cross validation}
+ctrl <- trainControl(method = "cv", number = 100, classProbs=TRUE, summaryFunction=twoClassSummary)
+
+cvFit <- train(burned_chr ~ ., data = st_drop_geometry(fishnet) %>% 
+                                   na.omit() %>%
+                                   dplyr::select(
+                                     burned_chr,
+                                     elevation,
+                                     precip,
+                                     landcover), 
+                method="glm", family="binomial",
+                metric="ROC", trControl = ctrl)
+
+cvFit
+```
+
+The average sensitivity of the model dropped substantially, while the specificity increased. The area under the ROC remained consistent. Looking at the distribution of values in the plot below we can see that the model struggles with predicting true positives consistently, as evidenced by a less dense distribution of observations around the average. This result is to be expected, as wildfires are relatively rare events and we are modeling burned area, not just wildfire counts. Thus the model results are heavily dependent on extent of each individual fire, which is impacted by a number of variables we have no knowledge of or are not able to include at this time scale, including expediency of fire response, scale of response, and wind speed during the burn duration.
+
+Nevertheless, the predictions do aggregate around the average and are substantially better than a random prediction, indicating that the model is useful as is and generalizes reasonably well across random spatial contexts.
+
+```{r cv dist, message = FALSE, error = FALSE, warning = FALSE}
+dplyr::select(cvFit$resample, -Resample) %>%
+  gather(metric, value) %>%
+  left_join(gather(cvFit$results[2:4], metric, mean)) %>%
+  ggplot(aes(value)) + 
+    geom_histogram(bins=35, fill = "#f2cc8f") +
+    facet_wrap(~metric) +
+    geom_vline(aes(xintercept = mean), colour = "#81b29a", linetype = 3, size = 1.5) +
+    scale_x_continuous(limits = c(0, 1)) +
+    labs(x="Goodness of Fit", y="Count", title="CV Goodness of Fit Metrics",
+         subtitle = "Across-fold mean reprented as dotted lines") +
+    plotTheme()
+```
+
+# Cost/Benefit analysis
+
+This analysis has been to a method for optimizing the model to assist the CAL FIRE Administrative Units and the State of California in spending their resources in a way that maximizes public safety and welfare. A cost/benefit calculation can be made for each possible outcome identified in the confusion matrix discussion. The values used in following calculations are not in dollars or any particular unit, but rather should be thought of as a weighting system assigned based on the priority of each outcome. When a publicly agreed upon calculation can be determined for weighting the balance of life and property, it can be incorporated into this model, but for now the false negative outcome carries the maximum negative weight possible in this scale of -100 to 100. The cost/benefit equations for each outcome are detailed below:
+
+1. True Positive - Predicted correctly that a cell would burn. Resources allocated for mitigation, which halved the extent of the fire, and reduced the impact to life and property.
+cost/benefit = 50 * Count * 0.5
+
+2. True Negative - Predicted correctly that a cell would not burn, no action taken.
+cost/benefit = 0 * Count
+
+3. False Positive - Predicted that an area would burn, but it did not, resulting in some habitat loss and resource expense.
+cost/benefit = -20 * Count
+
+4. False Negative - Predicted incorrectly that a cell would not burn, but it did, resulting in heavy costs to life and property.
+cost/benefit = -100 * Count
+
+## Define the scenarios
+
+```{r cost_benefit, results = 'hide'}
+cost_benefit_table <-
+   testProbs %>%
+      count(predOutcome, Outcome) %>%
+      summarize(
+        True_Positive = sum(n[predOutcome==1 & Outcome==1]),
+        True_Negative = sum(n[predOutcome==0 & Outcome==0]),
+        False_Positive = sum(n[predOutcome==1 & Outcome==0]),
+        False_Negative = sum(n[predOutcome==0 & Outcome==1])) %>%
+      gather(Variable, Count) %>%
+       mutate(Revenue =
+               case_when(
+                 Variable == "True_Positive"  ~ ((50 * Count * .50) - (25 * Count * .20)),
+                 Variable == "True_Negative"  ~ (0 * Count),
+                 Variable == "False_Positive" ~ ((-10) * Count),
+                 Variable == "False_Negative" ~ ((-100) * Count))) %>%
+    bind_cols(
+      data.frame(
+        Description = c(
+              "Predicted correctly that a cell would burn. Resources allocated for mitigation, which halved the extent of the fire, and reduced the impact to life and property",
+              "Predicted correctly that a cell would not burn, no action taken, resources saved",
+              "Predicted that an area would burn, but it did not, resulting in some habitat loss and resource expense", 
+              "Predicted incorrectly that a cell would not burn, but it did, resulting in heavy costs to life and property"
+              )
+        )
+      ) 
+```
+
+``` {r table_cost_benefit}
+kable(cost_benefit_table,
+       caption = "Cost/Benefit Table") %>% 
+  kable_styling()
+```
+
+## Optimize Thresholds
+
+At the moment, the chosen threshold results in slightly better than a break even outcome for the fire district and the public, primarily due to the cost of false negatives. The following process seeks to optimize the threshold for maximal public benefit. 
+
+### Set-up Threshold Function
+
+The function below iterates through possible threshold values in increments of 0.01 and calculates the revenue of each prediction based on the type of outcome predicted at each threshold.
+
+```{r iterate_threshold}
+iterateThresholds = function(data) {
+  x = .01
+  all_prediction = data.frame()
+  while (x <= 1) {
+  
+  this_prediction =
+      data %>%
+      mutate(predOutcome = ifelse(Probs > x, 1, 0)) %>%
+      count(predOutcome, Outcome) %>%
+      summarize(True_Negative = sum(n[predOutcome==0 & Outcome==0]),
+                True_Positive = sum(n[predOutcome==1 & Outcome==1]),
+                False_Negative = sum(n[predOutcome==0 & Outcome==1]),
+                False_Positive = sum(n[predOutcome==1 & Outcome==0])) %>%
+     gather(Variable, Count) %>%
+     mutate(cost_benefit =
+               ifelse(Variable == "True_Positive", ((50 * Count * .50) - (25 * Count * .20)),
+                      ifelse(Variable == "True_Negative", (0 * Count),
+                             ifelse(Variable == "False_Positive", ((-10) * Count),
+                                    ((-100) * Count)
+                                    )
+                             )
+                      ),
+            Threshold = x)
+  
+  all_prediction = rbind(all_prediction, this_prediction)
+  x = x + .01
+  }
+return(all_prediction)
+}
+```
+
+### Run the optimization
+
+A dataframe is created that holds all of the cost/benefit calculations by threshold.
+
+```{r cb_model}
+whichThreshold = iterateThresholds(testProbs)
+
+whichThreshold_cb <- whichThreshold %>% 
+  mutate(blocks = Count) %>%
+  group_by(Threshold) %>% 
+  summarize(cost_benefit = sum(cost_benefit),
+            blocks = sum(blocks))
+```
+
+#### Plot of Revenue by Confusion Matrix metric and Threshold
+
+```{r confusion_matrix_by_threshold}
+whichThreshold %>%
+  ggplot(.,aes(Threshold, cost_benefit, colour = Variable)) +
+  geom_point() +
+  scale_colour_manual(values = c("#e07a5f","#3d405b","#f2cc8f","#81b29a")) +    
+  labs(title = "Cost/Benefit by confusion matrix type and threshold",
+       y = "Cost/Benefit") +
+  plotTheme() +
+  guides(colour=guide_legend(title = "Confusion Matrix")) 
+```
+
+#### Plotting Cost/Benefit as a function of Threshold
+
+The plot below illustrates the change in cost/benefit across all possible thresholds. The higher the threshold, the more burned cells will go unpredicted, and the higher the public cost. The optimal threshold is 7%. 
+
+```{r optimal_threshold}
+pull(arrange(whichThreshold_cb, -cost_benefit)[1,1])
+```
+
+``` {r plot_threshold_cb}
+ggplot(whichThreshold_cb)+
+  geom_line(aes(x = Threshold, y = cost_benefit)) +
+  geom_vline(xintercept =  pull(arrange(whichThreshold_cb, -cost_benefit)[1,1])) +
+  plotTheme() +
+    labs(title = "Cost/Benefit By Threshold For Test Set",
+         subtitle = "Vertical Line Denotes Optimal Threshold")
+```
+
+#### Comparing Optimal Threshold to Original 25% threshold
+
+The table below shows the Cost/Benefit for the optimal threshold of 7 percent and a 25 percent threshold. The optimal threshold yields higher public benefit.
+
+```{r comparison_table}
+whichThreshold_cb %>%
+  filter(Threshold == "0.25" | Threshold == "0.07") %>%
+  mutate(Scenario = case_when(Threshold == "0.25" ~ "25% Threshold", Threshold == "0.07" ~ "Optimal Threshold")) %>%
+  dplyr::select(Scenario, cost_benefit) %>%
+  kable() %>%
+  kable_styling()
+```
+
+# Create optimized model
+
+```{r pred outcomes optimized}
+testProbs <- testProbs %>%
+  mutate(predOutcome_opt  = as.factor(ifelse(testProbs$Probs > 0.07 , 1, 0)))
+```
+
+```{r confusion matrix optimized}
+caret::confusionMatrix(testProbs$predOutcome_opt, testProbs$Outcome, 
+                       positive = "1")
+```
+
+The cross validation results using the 7% outcome threshold are summarized below, and illustrate that the sensitivity remained extremely high across all 100 folds. This cost/benefit scenario is possibly a bit extreme, and encourages a large number of false positives, but it illustrates the power of optimizing the model to suit the constraints of a Fire Administration Unit.
+
+```{r cross validation_opt}
+ctrl <- trainControl(method = "cv", number = 100, classProbs=TRUE,
+                     savePredictions = "all", summaryFunction=twoClassSummary)
+
+cvFit_opt <- train(burned_chr ~ ., data = st_drop_geometry(fishnet) %>% 
+                                   na.omit() %>%
+                                   dplyr::select(
+                                     burned_chr,
+                                     elevation,
+                                     precip,
+                                     landcover), 
+                method="glm", family="binomial",
+                metric="ROC", trControl = ctrl)
+```
+
+```{r thresholder}
+thresholder(cvFit_opt, .07, final = TRUE) %>%
+  dplyr::select(prob_threshold, Sensitivity, Specificity) %>%
+  kable() %>% kable_styling()
+```
+
+# Wildfire Risk Predictions
+
+Wildfire probabilities and predictions for the whole data set are mapped below.
+
+```{r make final predictions}
+fishnet <- fishnet %>%
+  mutate(Probs = predict(reg, fishnet, type= "response"))
+fishnet$predOutcome = as.factor(ifelse(fishnet$Probs > 0.07 , "burned", "not"))
+```
+
+Two maps are created to illustrate the wildfire risk predictions. The first presents the probability calculated, represented as a continuous scale of risk.
+
+```{r plot final probabilities}
+ggplot() +
+  geom_sf(data = fishnet, aes(fill = Probs), colour = NA) +
+  scale_fill_viridis(option = 'magma', direction = -1) +
+  labs(title = "Wildfire Risk Probabilities",
+       subtitle = "based on 2019 precipitation data") +
+  mapTheme()
+```
+
+The second presents the predicted outcomes, utilizing the optimized outcome threshold of 7%. The presence of the false positives is apparent.
+
+```{r plot final predictions}
+ggplot() +
+  geom_sf(data = fishnet, aes(fill = predOutcome), colour = NA) +
+  scale_fill_manual(values = c("not" = "#240046", "burned" = "#892b64")) +
+  labs(title = "Wildfire Risk Predictions, 7% Outcome Threshold",
+       subtitle = "based on 2019 precipitation data") +
+  mapTheme()
+```
+
+# Conclusion
+
+Much can still be done to improve both the accuracy and generalizability of the Spothot model. There are obvious improvements that apply to any model (better feature engineering, for example), but two stand out in particular in the wildfire context.
+
+First, the model’s predictive power would likely be substantially strengthened if the model were expanded geographically to encompass the entirety of California. Statewide, the three main data features—land cover, elevation, and precipitation—vary far more dramatically than what can be found only within Butte County. Incorporating this level of diversity will help the model to predict both more accurately and across greater contexts.
+
+Second, operating on different time-scales within certain characteristics will help to capture the more ephemeral fluctuations critical to understanding wildfire risk. Wildfires are as much a product of large, static features such as vegetation types as fleeting phenomena such as fluctuations in precipitation. 2019 was an abnormally wet year compared to California's recent weather patterns, and there were no fires within Butte County that year. This prevented our team from breaking the model down by year within Butte County, because the algorithm was unable to resolve without a positive class observation (i.e. "burned"). 2018 and 2020 were indicative of the drought California has experienced in recent years, and both years recorded the largest wildfires California has ever seen. To predict risk during a year, a way to understand long term interaction of monthly rainfall totals with wildfire risk is needed. Currently, only January through May monthly rainfall totals are available from PRISM, which illustrates the data lag challenges we face when trying to predict a phenomenon that is so temporally dependent. If the model could train on such a micro-scale, it would be of significantly greater utility to governments in predicting wildfire risk on a moment’s notice.
